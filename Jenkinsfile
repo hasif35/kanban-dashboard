@@ -1,59 +1,78 @@
-
 pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = 'hhasif/kanban-dashboard'
+        IMAGE_NAME = "hhasif/kanban-dashboard"
     }
 
     stages {
 
         stage('Checkout') {
             steps {
-                echo 'Source code checked out from GitHub'
+                git branch: 'main',
+                    url: 'https://github.com/hasif35/kanban-dashboard.git'
             }
         }
 
         stage('Build Docker Image') {
             steps {
-                sh '''
+                sh """
                     docker build \
                     -t ${IMAGE_NAME}:${BUILD_NUMBER} \
                     -t ${IMAGE_NAME}:latest .
-                '''
+                """
             }
         }
 
-        stage('Push to Docker Hub') {
+        stage('Docker Login') {
             steps {
                 withCredentials([
                     usernamePassword(
                         credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DOCKERHUB_USER',
-                        passwordVariable: 'DOCKERHUB_TOKEN'
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
                     )
                 ]) {
                     sh '''
-                        echo "$DOCKERHUB_TOKEN" | docker login \
-                        -u "$DOCKERHUB_USER" --password-stdin
-
-                        docker push ${IMAGE_NAME}:${BUILD_NUMBER}
-                        docker push ${IMAGE_NAME}:latest
-
-                        docker logout
+                        echo "$DOCKER_PASS" | docker login \
+                        -u "$DOCKER_USER" \
+                        --password-stdin
                     '''
                 }
             }
         }
+
+        stage('Push Image') {
+            steps {
+                sh """
+                    docker push ${IMAGE_NAME}:${BUILD_NUMBER}
+                    docker push ${IMAGE_NAME}:latest
+                """
+            }
+        }
+
+        stage('Deploy Container') {
+            steps {
+                sh """
+                    docker rm -f kanban-dashboard || true
+
+                    docker run -d \
+                    --name kanban-dashboard \
+                    -p 3000:80 \
+                    ${IMAGE_NAME}:latest
+                """
+            }
+        }
+
     }
 
     post {
         success {
-            echo 'Docker image successfully pushed!'
+            echo 'Build, Push and Deployment Successful!'
         }
 
         failure {
-            echo 'Pipeline failed. Check the Jenkins console output.'
+            echo 'Pipeline Failed!'
         }
     }
 }
