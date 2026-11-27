@@ -55,12 +55,13 @@ pipeline {
         stage('Deploy Container') {
             steps {
                 sh """
+                    docker rm -f kanban-test || true
                     docker rm -f kanban-dashboard || true
 
                     docker run -d \
                     --name kanban-dashboard \
-                    -p 3000:80 \
-                    ${IMAGE_NAME}:latest
+                    -p 3000:8080 \
+                    hhasif/kanban-dashboard:latest
                 """
             }
         }
