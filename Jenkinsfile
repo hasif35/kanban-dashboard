@@ -1,79 +1,150 @@
+
 pipeline {
     agent any
 
+    options {
+        skipDefaultCheckout(true)
+    }
+
     environment {
-        IMAGE_NAME = "hhasif/kanban-dashboard"
+        IMAGE_REPO = 'hhasif/kanban-dashboard'
+        CONTAINER_NAME = 'kanban-dashboard'
+        BACKUP_NAME = 'kanban-dashboard-previous'
+        DEPLOY_PORT = '3000'
+        CONTAINER_PORT = '8080'
     }
 
     stages {
 
-        stage('Checkout') {
+        stage('Checkout Source') {
             steps {
-                git branch: 'main',
-                    url: 'https://github.com/hasif35/kanban-dashboard.git'
+                checkout scm
+
+                script {
+                    env.GIT_SHA = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.IMAGE_TAG = "${BUILD_NUMBER}-${env.GIT_SHA}"
+
+                    echo "Git SHA: ${env.GIT_SHA}"
+                    echo "Image Tag: ${env.IMAGE_TAG}"
+                }
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Docker Build & Tag') {
             steps {
-                sh """
+                sh '''
                     docker build \
-                    -t ${IMAGE_NAME}:${BUILD_NUMBER} \
-                    -t ${IMAGE_NAME}:latest .
-                """
+                      -t "$IMAGE_REPO:$IMAGE_TAG" \
+                      -t "$IMAGE_REPO:latest" .
+                '''
             }
         }
 
-        stage('Docker Login') {
+        stage('Registry Login & Push') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_PASS'
-                    )
-                ]) {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
                     sh '''
-                        echo "USER=$DOCKER_USER"
-                        echo "$DOCKER_PASS" | docker login \
-                        -u "$DOCKER_USER" \
-                        --password-stdin
+                        set +x
+                        printf '%s' "$DOCKER_PASS" |
+                          docker login -u "$DOCKER_USER" --password-stdin
+
+                        docker push "$IMAGE_REPO:$IMAGE_TAG"
+                        docker push "$IMAGE_REPO:latest"
+
+                        docker logout
                     '''
                 }
             }
         }
 
-        stage('Push Image') {
+        stage('Deploy to EC2') {
             steps {
-                sh """
-                    docker push ${IMAGE_NAME}:${BUILD_NUMBER}
-                    docker push ${IMAGE_NAME}:latest
-                """
-            }
-        }
+                script {
+                    env.DEPLOY_ATTEMPTED = 'true'
+                }
 
-        stage('Deploy Container') {
-            steps {
-                sh """
-                    docker rm -f kanban-test || true
-                    docker rm -f kanban-dashboard || true
+                sh '''
+                    docker rm -f "$BACKUP_NAME" 2>/dev/null || true
+
+                    if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+                        docker stop "$CONTAINER_NAME"
+                        docker rename "$CONTAINER_NAME" "$BACKUP_NAME"
+                    fi
 
                     docker run -d \
-                    --name kanban-dashboard \
-                    -p 3000:8080 \
-                    hhasif/kanban-dashboard:latest
-                """
+                      --restart unless-stopped \
+                      --name "$CONTAINER_NAME" \
+                      -p "$DEPLOY_PORT:$CONTAINER_PORT" \
+                      "$IMAGE_REPO:$IMAGE_TAG"
+                '''
             }
         }
 
+        stage('Health Check') {
+            steps {
+                sh '''
+                    echo "Checking application health..."
+
+                    for attempt in $(seq 1 30); do
+                        if curl -fsS \
+                          "http://127.0.0.1:$DEPLOY_PORT/" >/dev/null; then
+                            echo "Application health check PASSED"
+                            exit 0
+                        fi
+
+                        echo "Attempt $attempt: Application not ready"
+                        sleep 2
+                    done
+
+                    echo "Application health check FAILED"
+                    exit 1
+                '''
+            }
+        }
+
+        stage('Finalize Deployment') {
+            steps {
+                sh '''
+                    docker rm -f "$BACKUP_NAME" 2>/dev/null || true
+                    echo "Previous container removed."
+                '''
+            }
+        }
     }
 
     post {
         success {
-            echo 'Build, Push and Deployment Successful!'
+            echo 'CI/CD Pipeline Successful!'
+            echo 'Build, Push, Deployment and Health Check Passed!'
         }
 
         failure {
+            script {
+                if (env.DEPLOY_ATTEMPTED == 'true') {
+                    echo 'Deployment failed. Attempting rollback...'
+
+                    sh '''
+                        docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+                        if docker inspect "$BACKUP_NAME" >/dev/null 2>&1; then
+                            docker rename "$BACKUP_NAME" "$CONTAINER_NAME"
+                            docker start "$CONTAINER_NAME"
+                            echo "Rollback completed."
+                        else
+                            echo "No previous container available for rollback."
+                        fi
+                    '''
+                }
+            }
+
             echo 'Pipeline Failed!'
         }
     }
