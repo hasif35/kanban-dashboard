@@ -90,10 +90,14 @@ pipeline {
                     docker run -d \
                       --restart unless-stopped \
                       --name "$CONTAINER_NAME" \
+                      --memory=250m \
+                      --memory-reservation=125m \
+                      --memory-swap=250m \
+                      --cpus=0.25 \
                       -p "$DEPLOY_PORT:$CONTAINER_PORT" \
                       "$IMAGE_REPO:$IMAGE_TAG"
 
-                    echo "New container deployed."
+                    echo "New container deployed with resource limits."
                 '''
             }
         }
