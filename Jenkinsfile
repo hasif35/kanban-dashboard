@@ -75,10 +75,8 @@ pipeline {
                 sh '''
                     echo "Preparing deployment..."
 
-                    # Remove any older backup
                     docker rm -f "$BACKUP_NAME" 2>/dev/null || true
 
-                    # Preserve existing working container
                     if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
                         docker stop "$CONTAINER_NAME"
                         docker rename "$CONTAINER_NAME" "$BACKUP_NAME"
@@ -86,7 +84,6 @@ pipeline {
                         echo "Previous container backed up."
                     fi
 
-                    # Deploy new version
                     docker run -d \
                       --restart unless-stopped \
                       --name "$CONTAINER_NAME" \
@@ -174,10 +171,8 @@ pipeline {
 
                     echo "PASSED: Application returned HTTP 200."
 
-                    echo "===================================="
                     echo "ALL HEALTH CHECKS PASSED!"
                     echo "DEPLOYMENT VALIDATION SUCCESSFUL!"
-                    echo "===================================="
                 '''
             }
         }
@@ -190,7 +185,6 @@ pipeline {
             echo 'Build, Push, Deployment and All Health Checks Passed!'
 
             sh '''
-                # Remove old container only after successful validation
                 docker rm -f "$BACKUP_NAME" 2>/dev/null || true
 
                 echo "Previous backup cleaned up."
@@ -203,9 +197,25 @@ pipeline {
                 if (env.DEPLOY_ATTEMPTED == 'true') {
 
                     echo 'DEPLOYMENT FAILED!'
-                    echo 'Starting automatic rollback...'
+                    echo 'Collecting failure diagnostics before rollback...'
 
                     sh '''
+                        echo "===== FAILURE DIAGNOSTICS ====="
+
+                        echo "Container status:"
+                        docker ps -a
+
+                        echo "Container health details:"
+                        docker inspect "$CONTAINER_NAME" \
+                          --format='Status: {{.State.Status}} | Health: {{if .State.Health}}{{.State.Health.Status}}{{else}}No healthcheck{{end}}' \
+                          2>/dev/null || true
+
+                        echo "Container application logs:"
+                        docker logs --timestamps --tail 100 "$CONTAINER_NAME" \
+                          2>&1 || true
+
+                        echo "===== STARTING ROLLBACK ====="
+
                         # Remove failed new container
                         docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
