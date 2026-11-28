@@ -95,6 +95,13 @@ pipeline {
             }
         }
 
+        stage('Simulate Failure - Rollback Test') {
+           steps {
+                   echo 'Intentionally triggering failure to test rollback'
+                   error('TEST FAILURE: Verifying automatic rollback')
+           }
+        }
+
         stage('Health Check & Validation') {
             steps {
                 sh '''
