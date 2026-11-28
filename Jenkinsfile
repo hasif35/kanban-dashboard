@@ -1,105 +1,136 @@
 
 pipeline {
-
     agent any
 
     options {
         skipDefaultCheckout(true)
         disableConcurrentBuilds()
+        timestamps()
     }
 
     environment {
         IMAGE_REPO = 'hhasif/kanban-dashboard'
-
         PROXY_NAME = 'kanban-proxy'
         DOCKER_NETWORK = 'kanban-net'
         NGINX_CONF = '/opt/kanban/kanban-nginx.conf'
-
         DEPLOY_PORT = '3000'
         CONTAINER_PORT = '8080'
-
-        DEPLOY_ATTEMPTED = 'false'
-
-        ACTIVE_COLOR = ''
-        TARGET_COLOR = ''
-        ACTIVE_NAME = ''
-        TARGET_NAME = ''
     }
 
     stages {
 
-        // 1. CHECKOUT SOURCE
+        // ==========================================
+        // 1. CHECKOUT SOURCE CODE
+        // ==========================================
 
         stage('Checkout Source') {
             steps {
                 checkout scm
 
                 script {
-                    env.GIT_SHA = sh(
+                    def gitSha = sh(
                         script: 'git rev-parse --short=7 HEAD',
                         returnStdout: true
                     ).trim()
 
-                    env.IMAGE_TAG = "${BUILD_NUMBER}-${env.GIT_SHA}"
+                    def imageTag = "${BUILD_NUMBER}-${gitSha}"
 
-                    echo "Git SHA: ${env.GIT_SHA}"
-                    echo "Image Tag: ${env.IMAGE_TAG}"
+                    writeFile(
+                        file: '.build-meta',
+                        text: "GIT_SHA=${gitSha}\nIMAGE_TAG=${imageTag}\n"
+                    )
+
+                    echo "Git SHA: ${gitSha}"
+                    echo "Image Tag: ${imageTag}"
                 }
             }
         }
 
-        // 2. DOCKER BUILD AND TAG
+        // ==========================================
+        // 2. DOCKER BUILD
+        // ==========================================
 
         stage('Docker Build & Tag') {
             steps {
                 sh '''
                     set -eu
+                    . ./.build-meta
+
+                    echo "===== DOCKER BUILD ====="
 
                     docker build \
                       -t "$IMAGE_REPO:$IMAGE_TAG" \
                       -t "$IMAGE_REPO:latest" .
+
+                    echo "Docker image built successfully."
+                    docker images "$IMAGE_REPO"
                 '''
             }
         }
 
-        // 3. REGISTRY LOGIN AND PUSH
+        // ==========================================
+        // 3. DOCKER HUB LOGIN AND PUSH
+        // ==========================================
 
         stage('Registry Login & Push') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-creds',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
-                )]) {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
                     sh '''
+                        set -eu
+                        . ./.build-meta
+
+                        echo "===== DOCKER HUB LOGIN ====="
+
                         set +x
 
                         trap 'docker logout >/dev/null 2>&1 || true' EXIT
 
                         printf '%s' "$DOCKER_PASS" |
-                          docker login -u "$DOCKER_USER" --password-stdin
+                          docker login \
+                            -u "$DOCKER_USER" \
+                            --password-stdin
+
+                        echo "===== PUSHING VERSIONED IMAGE ====="
 
                         docker push "$IMAGE_REPO:$IMAGE_TAG"
+
+                        echo "===== PUSHING LATEST IMAGE ====="
+
                         docker push "$IMAGE_REPO:latest"
+
+                        echo "Docker Hub push completed."
                     '''
                 }
             }
         }
 
-        // 4. IDENTIFY ACTIVE ENVIRONMENT
+        // ==========================================
+        // 4. IDENTIFY ACTIVE BLUE/GREEN ENVIRONMENT
+        // ==========================================
 
         stage('Identify Active Environment') {
             steps {
                 script {
+                    echo "===== IDENTIFYING ACTIVE ENVIRONMENT ====="
 
-                    def active = sh(
+                    def detectedColor = sh(
                         script: '''
                             set -eu
 
-                            if grep -q 'proxy_pass http://kanban-blue:8080' "$NGINX_CONF"; then
+                            if grep -Fq \
+                              'proxy_pass http://kanban-blue:8080' \
+                              "$NGINX_CONF"; then
                                 echo blue
 
-                            elif grep -q 'proxy_pass http://kanban-green:8080' "$NGINX_CONF"; then
+                            elif grep -Fq \
+                              'proxy_pass http://kanban-green:8080' \
+                              "$NGINX_CONF"; then
                                 echo green
 
                             else
@@ -109,60 +140,73 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    if (!(active in ['blue', 'green'])) {
-                        error("Cannot identify active environment: ${active}")
+                    echo "Detected active color: [${detectedColor}]"
+
+                    if (!(detectedColor in ['blue', 'green'])) {
+                        error('Unable to identify active Blue-Green environment. Deployment stopped.')
                     }
 
-                    // Assign Jenkins environment variables
+                    def targetColor =
+                        detectedColor == 'blue' ? 'green' : 'blue'
 
-                    env.ACTIVE_COLOR = active
+                    def activeName = "kanban-${detectedColor}"
+                    def targetName = "kanban-${targetColor}"
 
-                    env.TARGET_COLOR =
-                        active == 'blue' ? 'green' : 'blue'
+                    // Persist state in workspace.
+                    // Later stages read this file directly.
 
-                    env.ACTIVE_NAME = "kanban-${env.ACTIVE_COLOR}"
+                    writeFile(
+                        file: '.bg-state',
+                        text: """ACTIVE_COLOR=${detectedColor}
+TARGET_COLOR=${targetColor}
+ACTIVE_NAME=${activeName}
+TARGET_NAME=${targetName}
+DEPLOY_ATTEMPTED=true
+"""
+                    )
 
-                    env.TARGET_NAME = "kanban-${env.TARGET_COLOR}"
+                    echo "Active color: ${detectedColor}"
+                    echo "Active container: ${activeName}"
+                    echo "Target color: ${targetColor}"
+                    echo "Target container: ${targetName}"
 
-                    env.DEPLOY_ATTEMPTED = 'true'
-
-                    echo "===== ENVIRONMENT IDENTIFICATION ====="
-
-                    echo "Active environment: ${env.ACTIVE_COLOR}"
-                    echo "Active container: ${env.ACTIVE_NAME}"
-
-                    echo "New deployment target: ${env.TARGET_COLOR}"
-                    echo "Target container: ${env.TARGET_NAME}"
+                    echo "Deployment state saved successfully."
                 }
             }
         }
 
-        // 5. DEPLOY INACTIVE ENVIRONMENT
+        // ==========================================
+        // 5. DEPLOY TO INACTIVE ENVIRONMENT
+        // ==========================================
 
         stage('Deploy Inactive Environment') {
             steps {
                 sh '''
                     set -eu
 
+                    . ./.bg-state
+                    . ./.build-meta
+
                     echo "===== DEPLOYING NEW ENVIRONMENT ====="
 
-                    # Verify Docker network
+                    echo "Active container: $ACTIVE_NAME"
+                    echo "Target container: $TARGET_NAME"
+                    echo "Image: $IMAGE_REPO:$IMAGE_TAG"
 
                     docker network inspect "$DOCKER_NETWORK" >/dev/null
 
-                    # Verify Nginx proxy
-
                     docker inspect "$PROXY_NAME" >/dev/null
 
-                    # Verify image exists locally
+                    # Verify that the existing production container
+                    # is still available before deployment.
 
-                    docker image inspect "$IMAGE_REPO:$IMAGE_TAG" >/dev/null
+                    docker inspect "$ACTIVE_NAME" >/dev/null
 
-                    # Remove previous inactive container if present
+                    # Remove only the old inactive candidate.
 
                     docker rm -f "$TARGET_NAME" 2>/dev/null || true
 
-                    # Deploy new application container
+                    # Start the new application container.
 
                     docker run -d \
                       --restart unless-stopped \
@@ -175,16 +219,23 @@ pipeline {
                       "$IMAGE_REPO:$IMAGE_TAG"
 
                     echo "New container started: $TARGET_NAME"
+
+                    docker ps -a \
+                      --filter "name=^${TARGET_NAME}$"
                 '''
             }
         }
 
+        // ==========================================
         // 6. NEW CONTAINER HEALTH CHECK
+        // ==========================================
 
         stage('New Container Health Check') {
             steps {
                 sh '''
                     set -eu
+
+                    . ./.bg-state
 
                     echo "===== CHECK 1: CONTAINER RUNNING ====="
 
@@ -206,18 +257,17 @@ pipeline {
                           --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' \
                           "$TARGET_NAME")
 
+                        echo "Health status: $HEALTH_STATUS ($attempt/30)"
+
                         if [ "$HEALTH_STATUS" = "healthy" ]; then
                             break
                         fi
 
                         if [ "$HEALTH_STATUS" = "unhealthy" ] ||
                            [ "$HEALTH_STATUS" = "no-healthcheck" ]; then
-
                             echo "Container health validation failed."
                             exit 1
                         fi
-
-                        echo "Waiting for health: $attempt/30"
 
                         sleep 2
                     done
@@ -232,24 +282,31 @@ pipeline {
                     echo "===== CHECK 3: DIRECT APPLICATION TEST ====="
 
                     docker exec "$TARGET_NAME" \
-                      wget -qO- "http://127.0.0.1:${CONTAINER_PORT}/" \
+                      wget -qO- \
+                      "http://127.0.0.1:${CONTAINER_PORT}/" \
                       >/dev/null
 
-                    echo "New application responds successfully."
+                    echo "Application responds successfully."
                 '''
             }
         }
 
+        // ==========================================
         // 7. SWITCH NGINX TRAFFIC
+        // ==========================================
 
         stage('Switch Traffic to New Environment') {
             steps {
                 sh '''
                     set -eu
 
+                    . ./.bg-state
+
                     echo "===== SWITCHING NGINX TRAFFIC ====="
 
-                    # Update existing Nginx configuration
+                    # Update existing Nginx configuration file.
+                    # Keep the file path unchanged because it is
+                    # bind-mounted into the proxy container.
 
                     cat > "$NGINX_CONF" <<EOF
 server {
@@ -266,27 +323,31 @@ server {
 }
 EOF
 
-                    # Validate configuration
+                    echo "===== VALIDATING NGINX CONFIGURATION ====="
 
                     docker exec "$PROXY_NAME" nginx -t
 
-                    # Reload Nginx
+                    echo "===== RELOADING NGINX ====="
 
                     docker exec "$PROXY_NAME" nginx -s reload
 
-                    echo "Nginx switched to $TARGET_NAME"
+                    echo "Traffic switched to: $TARGET_NAME"
                 '''
             }
         }
 
+        // ==========================================
         // 8. PRODUCTION VALIDATION
+        // ==========================================
 
         stage('Production Validation') {
             steps {
                 sh '''
                     set -eu
 
-                    echo "===== CHECKING PRODUCTION ENDPOINT ====="
+                    . ./.bg-state
+
+                    echo "===== PRODUCTION VALIDATION ====="
 
                     HTTP_STATUS=""
 
@@ -298,11 +359,11 @@ EOF
                           --max-time 5 \
                           "http://127.0.0.1:${DEPLOY_PORT}/" || true)
 
+                        echo "HTTP status: $HTTP_STATUS ($attempt/15)"
+
                         if [ "$HTTP_STATUS" = "200" ]; then
                             break
                         fi
-
-                        echo "Waiting for HTTP 200: $attempt/15"
 
                         sleep 2
                     done
@@ -318,64 +379,73 @@ EOF
 
                     grep 'proxy_pass' "$NGINX_CONF"
 
+                    echo "===== ACTIVE CONTAINER ====="
+
+                    docker ps \
+                      --filter "name=^${TARGET_NAME}$"
+
                     echo "BLUE-GREEN DEPLOYMENT SUCCESSFUL!"
                 '''
             }
         }
     }
 
-    // 9. POST ACTIONS
+    // ==========================================
+    // POST ACTIONS
+    // ==========================================
 
     post {
 
         success {
-            echo 'Blue-Green deployment successful!'
-
             sh '''
-                echo "===== DEPLOYMENT SUMMARY ====="
+                set -eu
 
-                echo "Previous environment: $ACTIVE_NAME"
-                echo "New active environment: $TARGET_NAME"
+                echo "===== DEPLOYMENT SUCCESSFUL ====="
 
-                echo "Previous container retained for rollback."
+                if [ -f .bg-state ]; then
+                    . ./.bg-state
 
-                docker ps \
-                  --filter "name=kanban-" \
-                  --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+                    echo "New active container: $TARGET_NAME"
+                    echo "Previous container: $ACTIVE_NAME"
 
-                echo "Deployment completed successfully."
+                    # Remove previous environment only after
+                    # successful production validation.
+
+                    docker rm -f "$ACTIVE_NAME" 2>/dev/null || true
+
+                    echo "Previous environment cleanup completed."
+                fi
             '''
+
+            echo 'Blue-Green deployment completed successfully!'
         }
 
         failure {
-            script {
+            sh '''
+                set +e
 
-                if (env.DEPLOY_ATTEMPTED == 'true' &&
-                    env.ACTIVE_NAME &&
-                    env.TARGET_NAME) {
+                echo "===== FAILURE DIAGNOSTICS ====="
 
-                    echo 'Deployment failed. Starting automatic rollback.'
+                docker ps -a
 
-                    sh '''
-                        set +e
+                if [ -f .bg-state ]; then
 
-                        echo "===== FAILURE DIAGNOSTICS ====="
+                    . ./.bg-state
 
-                        docker ps -a
+                    echo "Failed target: $TARGET_NAME"
+                    echo "Previous active: $ACTIVE_NAME"
 
-                        if docker inspect "$TARGET_NAME" >/dev/null 2>&1; then
-                            docker logs --tail 100 "$TARGET_NAME" 2>&1
-                        fi
+                    if [ "$DEPLOY_ATTEMPTED" = "true" ]; then
 
                         echo "===== RESTORING PREVIOUS ENVIRONMENT ====="
 
                         if docker inspect "$ACTIVE_NAME" >/dev/null 2>&1; then
 
-                            # Ensure previous application is running
+                            # Ensure previous application is running.
 
-                            docker start "$ACTIVE_NAME" 2>/dev/null || true
+                            docker start "$ACTIVE_NAME" >/dev/null 2>&1
 
-                            # Restore previous Nginx configuration
+                            # Restore previous Nginx backend.
 
                             cat > "$NGINX_CONF" <<EOF
 server {
@@ -392,61 +462,71 @@ server {
 }
 EOF
 
-                            # Validate and reload previous configuration
-
                             if docker exec "$PROXY_NAME" nginx -t; then
 
                                 docker exec "$PROXY_NAME" nginx -s reload
 
                                 echo "Previous traffic configuration restored."
 
-                                # Validate rollback
-
-                                ROLLBACK_STATUS=""
+                                ROLLBACK_OK=false
 
                                 for attempt in $(seq 1 15); do
 
-                                    ROLLBACK_STATUS=$(curl -sS \
-                                      -o /dev/null \
-                                      -w '%{http_code}' \
+                                    if curl -fsS \
                                       --max-time 5 \
-                                      "http://127.0.0.1:${DEPLOY_PORT}/" || true)
+                                      "http://127.0.0.1:${DEPLOY_PORT}/" \
+                                      >/dev/null; then
 
-                                    if [ "$ROLLBACK_STATUS" = "200" ]; then
+                                        echo "ROLLBACK SUCCESSFUL!"
+                                        ROLLBACK_OK=true
                                         break
                                     fi
 
+                                    echo "Waiting for rollback validation: $attempt/15"
                                     sleep 2
                                 done
 
-                                if [ "$ROLLBACK_STATUS" = "200" ]; then
-                                    echo "ROLLBACK SUCCESSFUL!"
+                                # Remove failed candidate only after
+                                # successful rollback validation.
+
+                                if [ "$ROLLBACK_OK" = "true" ]; then
+                                    docker rm -f "$TARGET_NAME" 2>/dev/null || true
                                 else
                                     echo "WARNING: Rollback validation failed."
+                                    echo "Both containers are being preserved for investigation."
                                 fi
 
                             else
-                                echo "ERROR: Nginx configuration validation failed."
+                                echo "WARNING: Restored Nginx configuration is invalid."
+                                echo "Containers are being preserved."
                             fi
 
                         else
                             echo "ERROR: Previous environment is unavailable."
+                            echo "Manual recovery may be required."
                         fi
+                    fi
 
-                        # Remove failed candidate only after rollback attempt
+                else
+                    echo "No deployment state file found."
+                    echo "Failure occurred before deployment state was saved."
+                fi
 
-                        docker rm -f "$TARGET_NAME" 2>/dev/null || true
+                echo "===== CONTAINER LOGS ====="
 
-                        echo "===== ROLLBACK PROCEDURE FINISHED ====="
-                    '''
-                }
+                if [ -f .bg-state ]; then
+                    . ./.bg-state
+                    docker logs --tail 100 "$TARGET_NAME" 2>&1
+                fi
 
-                echo 'Pipeline failed. Check diagnostics above.'
-            }
+                echo "===== ROLLBACK PROCEDURE FINISHED ====="
+            '''
+
+            echo 'Pipeline failed. Check diagnostics above.'
         }
 
         always {
-            echo 'Pipeline execution finished.'
+            echo '===== PIPELINE EXECUTION FINISHED ====='
         }
     }
 }
