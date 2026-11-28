@@ -5,6 +5,7 @@ pipeline {
 
     options {
         skipDefaultCheckout(true)
+        disableConcurrentBuilds()
     }
 
     environment {
@@ -18,6 +19,7 @@ pipeline {
         CONTAINER_PORT = '8080'
 
         DEPLOY_ATTEMPTED = 'false'
+
         ACTIVE_COLOR = ''
         TARGET_COLOR = ''
         ACTIVE_NAME = ''
@@ -25,6 +27,8 @@ pipeline {
     }
 
     stages {
+
+        // 1. CHECKOUT SOURCE
 
         stage('Checkout Source') {
             steps {
@@ -44,15 +48,21 @@ pipeline {
             }
         }
 
+        // 2. DOCKER BUILD AND TAG
+
         stage('Docker Build & Tag') {
             steps {
                 sh '''
+                    set -eu
+
                     docker build \
                       -t "$IMAGE_REPO:$IMAGE_TAG" \
                       -t "$IMAGE_REPO:latest" .
                 '''
             }
         }
+
+        // 3. REGISTRY LOGIN AND PUSH
 
         stage('Registry Login & Push') {
             steps {
@@ -63,6 +73,7 @@ pipeline {
                 )]) {
                     sh '''
                         set +x
+
                         trap 'docker logout >/dev/null 2>&1 || true' EXIT
 
                         printf '%s' "$DOCKER_PASS" |
@@ -75,19 +86,22 @@ pipeline {
             }
         }
 
+        // 4. IDENTIFY ACTIVE ENVIRONMENT
+
         stage('Identify Active Environment') {
             steps {
                 script {
-                    env.ACTIVE_COLOR = sh(
+
+                    def active = sh(
                         script: '''
-                            if grep -q \
-                              'proxy_pass http://kanban-blue:8080' \
-                              "$NGINX_CONF"; then
+                            set -eu
+
+                            if grep -q 'proxy_pass http://kanban-blue:8080' "$NGINX_CONF"; then
                                 echo blue
-                            elif grep -q \
-                              'proxy_pass http://kanban-green:8080' \
-                              "$NGINX_CONF"; then
+
+                            elif grep -q 'proxy_pass http://kanban-green:8080' "$NGINX_CONF"; then
                                 echo green
+
                             else
                                 echo unknown
                             fi
@@ -95,23 +109,35 @@ pipeline {
                         returnStdout: true
                     ).trim()
 
-                    if (env.ACTIVE_COLOR == 'unknown') {
-                        error('Cannot identify active Blue-Green environment.')
+                    if (!(active in ['blue', 'green'])) {
+                        error("Cannot identify active environment: ${active}")
                     }
 
+                    // Assign Jenkins environment variables
+
+                    env.ACTIVE_COLOR = active
+
                     env.TARGET_COLOR =
-                        env.ACTIVE_COLOR == 'blue' ? 'green' : 'blue'
+                        active == 'blue' ? 'green' : 'blue'
 
                     env.ACTIVE_NAME = "kanban-${env.ACTIVE_COLOR}"
+
                     env.TARGET_NAME = "kanban-${env.TARGET_COLOR}"
 
-                    echo "Active: ${env.ACTIVE_NAME}"
-                    echo "New deployment target: ${env.TARGET_NAME}"
-
                     env.DEPLOY_ATTEMPTED = 'true'
+
+                    echo "===== ENVIRONMENT IDENTIFICATION ====="
+
+                    echo "Active environment: ${env.ACTIVE_COLOR}"
+                    echo "Active container: ${env.ACTIVE_NAME}"
+
+                    echo "New deployment target: ${env.TARGET_COLOR}"
+                    echo "Target container: ${env.TARGET_NAME}"
                 }
             }
         }
+
+        // 5. DEPLOY INACTIVE ENVIRONMENT
 
         stage('Deploy Inactive Environment') {
             steps {
@@ -120,14 +146,24 @@ pipeline {
 
                     echo "===== DEPLOYING NEW ENVIRONMENT ====="
 
+                    # Verify Docker network
+
                     docker network inspect "$DOCKER_NETWORK" >/dev/null
+
+                    # Verify Nginx proxy
 
                     docker inspect "$PROXY_NAME" >/dev/null
 
-                    # Remove an old inactive container if present
+                    # Verify image exists locally
+
+                    docker image inspect "$IMAGE_REPO:$IMAGE_TAG" >/dev/null
+
+                    # Remove previous inactive container if present
+
                     docker rm -f "$TARGET_NAME" 2>/dev/null || true
 
-                    # Start new application without host port mapping
+                    # Deploy new application container
+
                     docker run -d \
                       --restart unless-stopped \
                       --name "$TARGET_NAME" \
@@ -142,6 +178,8 @@ pipeline {
                 '''
             }
         }
+
+        // 6. NEW CONTAINER HEALTH CHECK
 
         stage('New Container Health Check') {
             steps {
@@ -174,11 +212,13 @@ pipeline {
 
                         if [ "$HEALTH_STATUS" = "unhealthy" ] ||
                            [ "$HEALTH_STATUS" = "no-healthcheck" ]; then
+
                             echo "Container health validation failed."
                             exit 1
                         fi
 
                         echo "Waiting for health: $attempt/30"
+
                         sleep 2
                     done
 
@@ -200,6 +240,8 @@ pipeline {
             }
         }
 
+        // 7. SWITCH NGINX TRAFFIC
+
         stage('Switch Traffic to New Environment') {
             steps {
                 sh '''
@@ -207,14 +249,15 @@ pipeline {
 
                     echo "===== SWITCHING NGINX TRAFFIC ====="
 
-                    # Update the existing bind-mounted file in place.
-                    # Do not replace it using mv.
+                    # Update existing Nginx configuration
+
                     cat > "$NGINX_CONF" <<EOF
 server {
     listen 80;
 
     location / {
         proxy_pass http://${TARGET_NAME}:${CONTAINER_PORT};
+
         proxy_set_header Host \\$host;
         proxy_set_header X-Real-IP \\$remote_addr;
         proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
@@ -223,16 +266,20 @@ server {
 }
 EOF
 
-                    # Validate configuration before reload
+                    # Validate configuration
+
                     docker exec "$PROXY_NAME" nginx -t
 
-                    # Apply new backend
+                    # Reload Nginx
+
                     docker exec "$PROXY_NAME" nginx -s reload
 
                     echo "Nginx switched to $TARGET_NAME"
                 '''
             }
         }
+
+        // 8. PRODUCTION VALIDATION
 
         stage('Production Validation') {
             steps {
@@ -256,6 +303,7 @@ EOF
                         fi
 
                         echo "Waiting for HTTP 200: $attempt/15"
+
                         sleep 2
                     done
 
@@ -267,6 +315,7 @@ EOF
                     echo "Production HTTP status: 200"
 
                     echo "===== ACTIVE BACKEND ====="
+
                     grep 'proxy_pass' "$NGINX_CONF"
 
                     echo "BLUE-GREEN DEPLOYMENT SUCCESSFUL!"
@@ -275,29 +324,37 @@ EOF
         }
     }
 
+    // 9. POST ACTIONS
+
     post {
 
         success {
             echo 'Blue-Green deployment successful!'
 
             sh '''
-                echo "Removing previous application container..."
+                echo "===== DEPLOYMENT SUMMARY ====="
 
-                # Remove old environment only after production validation
-                docker rm -f "$ACTIVE_NAME" 2>/dev/null || true
+                echo "Previous environment: $ACTIVE_NAME"
+                echo "New active environment: $TARGET_NAME"
 
-                echo "Previous environment cleaned up."
-                echo "Active environment: $TARGET_NAME"
+                echo "Previous container retained for rollback."
+
+                docker ps \
+                  --filter "name=kanban-" \
+                  --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+                echo "Deployment completed successfully."
             '''
         }
 
         failure {
             script {
+
                 if (env.DEPLOY_ATTEMPTED == 'true' &&
                     env.ACTIVE_NAME &&
                     env.TARGET_NAME) {
 
-                    echo 'Deployment failed. Restoring previous environment.'
+                    echo 'Deployment failed. Starting automatic rollback.'
 
                     sh '''
                         set +e
@@ -306,12 +363,19 @@ EOF
 
                         docker ps -a
 
-                        docker logs --tail 100 "$TARGET_NAME" 2>&1
+                        if docker inspect "$TARGET_NAME" >/dev/null 2>&1; then
+                            docker logs --tail 100 "$TARGET_NAME" 2>&1
+                        fi
 
-                        echo "===== RESTORING PREVIOUS TRAFFIC ====="
+                        echo "===== RESTORING PREVIOUS ENVIRONMENT ====="
 
-                        # Restore previous backend configuration
                         if docker inspect "$ACTIVE_NAME" >/dev/null 2>&1; then
+
+                            # Ensure previous application is running
+
+                            docker start "$ACTIVE_NAME" 2>/dev/null || true
+
+                            # Restore previous Nginx configuration
 
                             cat > "$NGINX_CONF" <<EOF
 server {
@@ -319,6 +383,7 @@ server {
 
     location / {
         proxy_pass http://${ACTIVE_NAME}:${CONTAINER_PORT};
+
         proxy_set_header Host \\$host;
         proxy_set_header X-Real-IP \\$remote_addr;
         proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
@@ -327,43 +392,61 @@ server {
 }
 EOF
 
+                            # Validate and reload previous configuration
+
                             if docker exec "$PROXY_NAME" nginx -t; then
+
                                 docker exec "$PROXY_NAME" nginx -s reload
+
                                 echo "Previous traffic configuration restored."
-                            else
-                                echo "WARNING: Nginx configuration validation failed."
-                            fi
 
-                            # Keep previous application running
-                            docker start "$ACTIVE_NAME" 2>/dev/null || true
+                                # Validate rollback
 
-                            # Verify previous application through proxy
-                            for attempt in $(seq 1 15); do
+                                ROLLBACK_STATUS=""
 
-                                if curl -fsS \
-                                  "http://127.0.0.1:${DEPLOY_PORT}/" \
-                                  >/dev/null; then
+                                for attempt in $(seq 1 15); do
 
+                                    ROLLBACK_STATUS=$(curl -sS \
+                                      -o /dev/null \
+                                      -w '%{http_code}' \
+                                      --max-time 5 \
+                                      "http://127.0.0.1:${DEPLOY_PORT}/" || true)
+
+                                    if [ "$ROLLBACK_STATUS" = "200" ]; then
+                                        break
+                                    fi
+
+                                    sleep 2
+                                done
+
+                                if [ "$ROLLBACK_STATUS" = "200" ]; then
                                     echo "ROLLBACK SUCCESSFUL!"
-                                    break
+                                else
+                                    echo "WARNING: Rollback validation failed."
                                 fi
 
-                                sleep 2
-                            done
+                            else
+                                echo "ERROR: Nginx configuration validation failed."
+                            fi
 
                         else
                             echo "ERROR: Previous environment is unavailable."
                         fi
 
-                        # Remove failed candidate only after restoring traffic
+                        # Remove failed candidate only after rollback attempt
+
                         docker rm -f "$TARGET_NAME" 2>/dev/null || true
 
-                        echo "Rollback procedure completed."
+                        echo "===== ROLLBACK PROCEDURE FINISHED ====="
                     '''
                 }
-            }
 
-            echo 'Pipeline failed. Check diagnostics above.'
+                echo 'Pipeline failed. Check diagnostics above.'
+            }
+        }
+
+        always {
+            echo 'Pipeline execution finished.'
         }
     }
 }
